@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/fluxcd/pkg/auth/azure"
+	"github.com/fluxcd/pkg/auth/github"
 	"github.com/fluxcd/pkg/git"
 	"github.com/fluxcd/pkg/git/gogit"
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
@@ -162,13 +163,15 @@ func configurePush(cfg *gitSrcCfg, gitSpec *imagev1.GitSpec, checkoutRef *source
 }
 
 func getAuthOpts(ctx context.Context, c client.Client, repo *sourcev1.GitRepository) (*git.AuthOptions, error) {
+	var authSecret corev1.Secret
 	var data map[string][]byte
 	var err error
 	if repo.Spec.SecretRef != nil {
-		data, err = getSecretData(ctx, c, repo.Spec.SecretRef.Name, repo.GetNamespace())
+		authSecret, err = getSecret(ctx, c, repo.Spec.SecretRef.Name, repo.GetNamespace())
 		if err != nil {
 			return nil, fmt.Errorf("failed to get auth secret '%s/%s': %w", repo.GetNamespace(), repo.Spec.SecretRef.Name, err)
 		}
+		data = authSecret.Data
 	}
 
 	u, err := url.Parse(repo.Spec.URL)
@@ -181,11 +184,19 @@ func getAuthOpts(ctx context.Context, c client.Client, repo *sourcev1.GitReposit
 		return nil, fmt.Errorf("failed to configure authentication options: %w", err)
 	}
 
-	if repo.GetProvider() == sourcev1.GitProviderAzure {
+	switch repo.GetProvider() {
+	case sourcev1.GitProviderAzure:
 		opts.ProviderOpts = &git.ProviderOptions{
 			Name: sourcev1.GitProviderAzure,
 			AzureOpts: []azure.OptFunc{
 				azure.WithAzureDevOpsScope(),
+			},
+		}
+	case sourcev1.GitProviderGitHub:
+		opts.ProviderOpts = &git.ProviderOptions{
+			Name: sourcev1.GitProviderGitHub,
+			GitHubOpts: []github.OptFunc{
+				github.WithSecret(authSecret),
 			},
 		}
 	}
@@ -199,10 +210,11 @@ func getProxyOpts(ctx context.Context, c client.Client, repo *sourcev1.GitReposi
 	}
 	name := repo.Spec.ProxySecretRef.Name
 	namespace := repo.GetNamespace()
-	proxyData, err := getSecretData(ctx, c, name, namespace)
+	proxySecret, err := getSecret(ctx, c, name, namespace)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get proxy secret '%s/%s': %w", namespace, name, err)
 	}
+	proxyData := proxySecret.Data
 	address, ok := proxyData["address"]
 	if !ok {
 		return nil, fmt.Errorf("invalid proxy secret '%s/%s': key 'address' is missing", namespace, name)
@@ -218,11 +230,12 @@ func getProxyOpts(ctx context.Context, c client.Client, repo *sourcev1.GitReposi
 
 func getSigningEntity(ctx context.Context, c client.Client, namespace string, gitSpec *imagev1.GitSpec) (*openpgp.Entity, error) {
 	secretName := gitSpec.Commit.SigningKey.SecretRef.Name
-	secretData, err := getSecretData(ctx, c, secretName, namespace)
+	secret, err := getSecret(ctx, c, secretName, namespace)
 	if err != nil {
 		return nil, fmt.Errorf("could not find signing key secret '%s': %w", secretName, err)
 	}
 
+	secretData := secret.Data
 	data, ok := secretData[signingSecretKey]
 	if !ok {
 		return nil, fmt.Errorf("signing key secret '%s' does not contain a 'git.asc' key", secretName)
@@ -251,14 +264,14 @@ func getSigningEntity(ctx context.Context, c client.Client, namespace string, gi
 	return entity, nil
 }
 
-func getSecretData(ctx context.Context, c client.Client, name, namespace string) (map[string][]byte, error) {
+func getSecret(ctx context.Context, c client.Client, name, namespace string) (corev1.Secret, error) {
 	key := types.NamespacedName{
 		Namespace: namespace,
 		Name:      name,
 	}
 	var secret corev1.Secret
 	if err := c.Get(ctx, key, &secret); err != nil {
-		return nil, err
+		return secret, err
 	}
-	return secret.Data, nil
+	return secret, nil
 }
